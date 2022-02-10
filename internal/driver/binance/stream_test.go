@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -47,6 +48,44 @@ func Test_handlerMap(t *testing.T) {
 		close(c)
 		return true
 	})
+}
+
+func Test_handlerMap_LoadOrStore(t *testing.T) {
+	var m handlerMap
+
+	tests := []struct {
+		stream string
+		want   bool
+		wantOk bool
+	}{
+		{
+			"one",
+			true,
+			false,
+		},
+		{
+			"two",
+			true,
+			false,
+		},
+		{
+			"one",
+			true,
+			true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.stream, func(t *testing.T) {
+			got, ok := m.LoadOrStore(tt.stream, make(chan<- []byte))
+
+			if (got != nil) != tt.want {
+				t.Errorf("handlerMap.LoadOrStore() got = %v, want %v", got, tt.want)
+			}
+			if ok != tt.wantOk {
+				t.Errorf("handlerMap.LoadOrStore() got1 = %v, want %v", ok, tt.wantOk)
+			}
+		})
+	}
 }
 
 func TestStream_dispatch(t *testing.T) {
@@ -139,9 +178,7 @@ func TestStream_dispatch(t *testing.T) {
 			handler := make(chan []byte, 1)
 			s.handlers.Store("handler", handler)
 
-			s.wg.Add(1)
-			go s.dispatch(tt.resp)
-			s.wg.Wait()
+			s.dispatch(tt.resp)
 
 			close(rc)
 			close(handler)
@@ -155,6 +192,29 @@ func TestStream_dispatch(t *testing.T) {
 			}
 
 		})
+	}
+}
+
+func TestStream_dispatch_blocked(t *testing.T) {
+	logger := zerolog.New(zerolog.NewTestWriter(t))
+
+	s := &Stream{
+		ctx: logger.WithContext(testCTX),
+	}
+
+	handler := make(chan []byte)
+	s.handlers.Store("handler", handler)
+
+	go s.dispatch(streamResponse{
+		Stream: "handler",
+		Data:   json.RawMessage(`["Hello, World!"]`),
+	})
+
+	time.Sleep(1500 * time.Millisecond)
+
+	want := []byte(`["Hello, World!"]`)
+	if got := <-handler; !reflect.DeepEqual(got, want) {
+		t.Errorf("Stream.dispatch() stream resp = %s, want %s", got, want)
 	}
 }
 
@@ -347,5 +407,92 @@ func TestMethodRequest(t *testing.T) {
 	}
 
 	cancel()
+	s.wg.Wait()
+}
+
+func TestStream_Subscribe(t *testing.T) {
+	ctx, cancel := context.WithCancel(testCTX)
+	defer cancel()
+
+	logger := zerolog.New(zerolog.NewTestWriter(t)).With().Timestamp().Logger()
+
+	s, err := NewStream(logger.WithContext(ctx))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		stream  string
+		wantErr bool
+	}{
+		{
+			"btcusdt@aggTrade",
+			false,
+		},
+		{
+			"btcusdt@aggTrade",
+			true,
+		},
+		{
+			"",
+			true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.stream, func(t *testing.T) {
+			got, err := s.Subscribe(tt.stream, 0)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Stream.Subscribe() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+
+			if !tt.wantErr {
+				if <-got == nil {
+					t.Fatal("no data received")
+				}
+
+				go func() {
+					for g := range got {
+						logger.Debug().RawJSON("got", g).Msg("")
+					}
+				}()
+			}
+		})
+	}
+	s.cancel()
+	s.wg.Wait()
+}
+
+func TestStream_Unsubscribe(t *testing.T) {
+	ctx, cancel := context.WithCancel(testCTX)
+	defer cancel()
+
+	logger := zerolog.New(zerolog.NewTestWriter(t)).With().Timestamp().Logger()
+
+	s, err := NewStream(logger.WithContext(ctx))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := s.Subscribe("btcusdt@aggTrade", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		for g := range c {
+			logger.Debug().RawJSON("got", g).Msg("")
+		}
+	}()
+
+	if err = s.Unsubscribe("btcusdt@aggTrade"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err = s.Unsubscribe("btcusdt@aggTrade"); err != nil {
+		t.Fatal(err)
+	}
+
+	s.cancel()
 	s.wg.Wait()
 }

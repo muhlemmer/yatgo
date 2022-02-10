@@ -21,8 +21,10 @@ package binance
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/muhlemmer/yatgo/internal/driver"
@@ -40,6 +42,19 @@ func (m *handlerMap) Store(stream string, c chan<- []byte) { m.Map.Store(stream,
 func (m *handlerMap) Load(stream string) (c chan<- []byte, ok bool) {
 	x, _ := m.Map.Load(stream)
 	c, ok = x.(chan<- []byte)
+	return c, ok
+}
+
+func (m *handlerMap) LoadOrStore(stream string, c chan<- []byte) (actual chan<- []byte, loaded bool) {
+	x, loaded := m.Map.LoadOrStore(stream, c)
+	actual = x.(chan<- []byte)
+
+	return actual, loaded
+}
+
+func (m *handlerMap) LoadAndDelete(stream string) (chan<- []byte, bool) {
+	x, _ := m.Map.LoadAndDelete(stream)
+	c, ok := x.(chan<- []byte)
 	return c, ok
 }
 
@@ -119,8 +134,7 @@ func (s *Stream) listen() {
 			return
 		}
 
-		s.wg.Add(1)
-		go s.dispatch(resp)
+		s.dispatch(resp)
 	}
 }
 
@@ -136,8 +150,6 @@ func (s *Stream) popResponseChan(id uint) (rc chan<- wsMethodResponse, ok bool) 
 }
 
 func (s *Stream) dispatch(resp streamResponse) {
-	defer s.wg.Done()
-
 	logger := zerolog.Ctx(s.ctx).With().Interface("resp", resp).Logger()
 	logger.Debug().Msg("dispatch response")
 
@@ -163,8 +175,17 @@ func (s *Stream) dispatch(resp streamResponse) {
 
 	if resp.Stream != "" {
 		if c, ok := s.handlers.Load(resp.Stream); ok {
-			c <- resp.Data
-			return
+			start := time.Now()
+
+			for {
+				select {
+				case c <- resp.Data:
+					return
+				case <-time.After(time.Millisecond):
+					logger := logger.Sample(zerolog.Rarely)
+					logger.Warn().Str("stream", resp.Stream).TimeDiff("blocked", time.Now(), start).Msg("dispatch channel blocked")
+				}
+			}
 		}
 	}
 
@@ -260,6 +281,8 @@ work:
 	s.close()
 }
 
+var newStreamLimiter = ratelimit.New(5)
+
 // NewStream dails the websocket endpoint for binance combined streams.
 // The returned stream is closed when the context is canceled.
 // On any error, the stream closes and terminates.
@@ -267,6 +290,8 @@ work:
 func NewStream(ctx context.Context) (*Stream, error) {
 	logger := zerolog.Ctx(ctx).With().Str("driver", "binance").Logger()
 	ctx = logger.WithContext(ctx)
+
+	newStreamLimiter.Take()
 
 	conn, err := driver.DialWebsocket(ctx, websocket.DefaultDialer, EndpointWsStream, nil)
 	if err != nil {
@@ -286,4 +311,51 @@ func NewStream(ctx context.Context) (*Stream, error) {
 	go s.sendQueue()
 
 	return s, nil
+}
+
+var (
+	ErrStreamSubscribed = errors.New("stream already subscribed")
+)
+
+// Subscribe to a named binanace websocket stream.
+// Raw JSON will be send to the returned channel for every complete message.
+// The order of messages is serialized in order of arrival,
+// and the Stream's listener will block untill the channel write completes.
+// The receiver must prevent exessive blocking of the channel.
+// The channel can be buffered with the size of bufLen,
+// to accomodate for short bursts of data.
+func (s *Stream) Subscribe(stream string, bufLen int) (<-chan []byte, error) {
+	c := make(chan []byte, bufLen)
+
+	if _, loaded := s.handlers.LoadOrStore(stream, c); loaded {
+		return nil, ErrStreamSubscribed
+	}
+
+	resp := <-s.addQueue(wsMethodRequest{
+		Method: MethodWsSubscribe,
+		Params: []interface{}{stream},
+	})
+
+	if resp.Error != nil {
+		return nil, fmt.Errorf("stream.Subscribe: %w", resp.Error)
+	}
+
+	return c, nil
+}
+
+func (s *Stream) Unsubscribe(stream string) error {
+	resp := <-s.addQueue(wsMethodRequest{
+		Method: MethodWsUnsubscribe,
+		Params: []interface{}{stream},
+	})
+
+	if resp.Error != nil {
+		return fmt.Errorf("stream.Unsubscribe: %w", resp.Error)
+	}
+
+	if c, ok := s.handlers.LoadAndDelete(stream); ok {
+		close(c)
+	}
+
+	return nil
 }
