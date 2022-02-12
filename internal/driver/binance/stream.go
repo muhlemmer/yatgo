@@ -24,45 +24,12 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/muhlemmer/yatgo/internal/driver"
 	"github.com/rs/zerolog"
 	"go.uber.org/ratelimit"
 )
-
-// map[<stream>]chan<- streamMsg
-type handlerMap struct {
-	sync.Map
-}
-
-func (m *handlerMap) Store(stream string, c chan<- []byte) { m.Map.Store(stream, c) }
-
-func (m *handlerMap) Load(stream string) (c chan<- []byte, ok bool) {
-	x, _ := m.Map.Load(stream)
-	c, ok = x.(chan<- []byte)
-	return c, ok
-}
-
-func (m *handlerMap) LoadOrStore(stream string, c chan<- []byte) (actual chan<- []byte, loaded bool) {
-	x, loaded := m.Map.LoadOrStore(stream, c)
-	actual = x.(chan<- []byte)
-
-	return actual, loaded
-}
-
-func (m *handlerMap) LoadAndDelete(stream string) (chan<- []byte, bool) {
-	x, _ := m.Map.LoadAndDelete(stream)
-	c, ok := x.(chan<- []byte)
-	return c, ok
-}
-
-func (m *handlerMap) Range(f func(stream string, c chan<- []byte) bool) {
-	m.Map.Range(func(key, value any) bool {
-		return f(key.(string), value.(chan<- []byte))
-	})
-}
 
 type wsMethodError struct {
 	Code int
@@ -94,7 +61,7 @@ type Stream struct {
 	cancel context.CancelFunc
 
 	conn     *websocket.Conn
-	handlers handlerMap
+	handlers driver.SyncMap[string, driver.JSONHandler]
 	wg       sync.WaitGroup
 
 	queue  chan wsMethodRequest
@@ -104,7 +71,7 @@ type Stream struct {
 	qrc    map[uint]chan<- wsMethodResponse
 }
 
-type streamResponse struct {
+type streamMessage struct {
 	Error *wsMethodError `json:"error,omitempty"`
 
 	// method response
@@ -121,20 +88,14 @@ func (s *Stream) listen() {
 	defer s.cancel()
 
 	for {
-		var resp streamResponse
-
 		_, data, err := s.conn.ReadMessage()
-		if err == nil {
-			err = json.Unmarshal(data, &resp)
-		}
-
-		zerolog.Ctx(s.ctx).Err(err).RawJSON("data", data).Msg("websocket receive")
-
 		if err != nil {
+			zerolog.Ctx(s.ctx).Err(err).Msg("websocket receive")
 			return
 		}
 
-		s.dispatch(resp)
+		s.wg.Add(1)
+		go s.dispatch(data)
 	}
 }
 
@@ -149,47 +110,62 @@ func (s *Stream) popResponseChan(id uint) (rc chan<- wsMethodResponse, ok bool) 
 	return rc, ok
 }
 
-func (s *Stream) dispatch(resp streamResponse) {
-	logger := zerolog.Ctx(s.ctx).With().Interface("resp", resp).Logger()
-	logger.Debug().Msg("dispatch response")
+func (s *Stream) dispatch(data []byte) {
+	defer s.wg.Done()
 
-	if resp.Error != nil {
-		if resp.ID != 0 {
-			s.sendErrResponse(resp.ID, resp.Error)
+	logger := zerolog.Ctx(s.ctx).With().RawJSON("data", data).Logger()
+	logger.Debug().Msg("")
+
+	defer func() {
+		x := recover()
+		if x != nil {
+			err, _ := x.(error)
+			if err == nil {
+				logger.Panic().Interface("value", x).Msg("re-panic in dispatch recover")
+				return
+			}
+
+			logger.Err(err).Msg("dispatch panic recover")
+		}
+	}()
+
+	var msg streamMessage
+	err := json.Unmarshal(data, &msg)
+
+	if err != nil {
+		panic(fmt.Errorf("stream.dispatch: %w", err))
+	}
+
+	if msg.Error != nil {
+		if msg.ID != 0 {
+			s.sendErrResponse(msg.ID, msg.Error)
 		} else {
-			logger.Err(resp.Error).Msg("dispatch response unhandeled")
+			logger.Err(msg.Error).Msg("protocol error in dispatch")
 		}
 
 		return
 	}
 
-	if resp.ID != 0 {
-		if c, ok := s.popResponseChan(resp.ID); ok {
+	if msg.ID != 0 {
+		if c, ok := s.popResponseChan(msg.ID); ok {
 			c <- wsMethodResponse{
-				ID:     resp.ID,
-				Result: resp.Result,
+				ID:     msg.ID,
+				Result: msg.Result,
 			}
+		} else {
+			logger.Warn().Msg("unknown request ID in method response dispatch")
+		}
+		return
+	}
+
+	if msg.Stream != "" {
+		if handler, ok := s.handlers.Load(msg.Stream); ok {
+			handler.Event(msg.Data)
 			return
 		}
 	}
 
-	if resp.Stream != "" {
-		if c, ok := s.handlers.Load(resp.Stream); ok {
-			start := time.Now()
-
-			for {
-				select {
-				case c <- resp.Data:
-					return
-				case <-time.After(time.Millisecond):
-					logger := logger.Sample(zerolog.Rarely)
-					logger.Warn().Str("stream", resp.Stream).TimeDiff("blocked", time.Now(), start).Msg("dispatch channel blocked")
-				}
-			}
-		}
-	}
-
-	logger.Warn().Msg("dispatch response unhandeled")
+	logger.Warn().Msg("unhandeled message in dispatch")
 }
 
 func (s *Stream) addReponseChan(rc chan<- wsMethodResponse) (id uint) {
@@ -243,8 +219,8 @@ func (s *Stream) close() {
 		s.sendErrResponse(msg.ID, err)
 	}
 
-	s.handlers.Range(func(_ string, c chan<- []byte) bool {
-		close(c)
+	s.handlers.Range(func(_ string, handler driver.JSONHandler) bool {
+		handler.Done()
 		return true
 	})
 }
@@ -288,7 +264,7 @@ var newStreamLimiter = ratelimit.New(5)
 // On any error, the stream closes and terminates.
 // Calling methods on the Stream after closingwill results in errors to be returned.
 func NewStream(ctx context.Context) (*Stream, error) {
-	logger := zerolog.Ctx(ctx).With().Str("driver", "binance").Logger()
+	logger := zerolog.Ctx(ctx).With().Str("driver", "binance").Str("obj", "Stream").Logger()
 	ctx = logger.WithContext(ctx)
 
 	newStreamLimiter.Take()
@@ -324,11 +300,9 @@ var (
 // The receiver must prevent exessive blocking of the channel.
 // The channel can be buffered with the size of bufLen,
 // to accomodate for short bursts of data.
-func (s *Stream) Subscribe(stream string, bufLen int) (<-chan []byte, error) {
-	c := make(chan []byte, bufLen)
-
-	if _, loaded := s.handlers.LoadOrStore(stream, c); loaded {
-		return nil, ErrStreamSubscribed
+func (s *Stream) Subscribe(stream string, handler driver.JSONHandler) error {
+	if _, loaded := s.handlers.LoadOrStore(stream, handler); loaded {
+		return ErrStreamSubscribed
 	}
 
 	resp := <-s.addQueue(wsMethodRequest{
@@ -337,10 +311,11 @@ func (s *Stream) Subscribe(stream string, bufLen int) (<-chan []byte, error) {
 	})
 
 	if resp.Error != nil {
-		return nil, fmt.Errorf("stream.Subscribe: %w", resp.Error)
+		s.handlers.Delete(stream)
+		return fmt.Errorf("stream.Subscribe: %w", resp.Error)
 	}
 
-	return c, nil
+	return nil
 }
 
 func (s *Stream) Unsubscribe(stream string) error {
@@ -353,8 +328,8 @@ func (s *Stream) Unsubscribe(stream string) error {
 		return fmt.Errorf("stream.Unsubscribe: %w", resp.Error)
 	}
 
-	if c, ok := s.handlers.LoadAndDelete(stream); ok {
-		close(c)
+	if handler, ok := s.handlers.LoadAndDelete(stream); ok {
+		handler.Done()
 	}
 
 	return nil

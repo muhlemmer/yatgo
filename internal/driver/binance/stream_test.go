@@ -20,7 +20,6 @@ package binance
 
 import (
 	"context"
-	"encoding/json"
 	"reflect"
 	"testing"
 	"time"
@@ -28,99 +27,59 @@ import (
 	"github.com/rs/zerolog"
 )
 
-func Test_handlerMap(t *testing.T) {
-	var m handlerMap
-
-	ss := []string{"a", "b", "c"}
-
-	for _, key := range ss {
-		m.Store(key, make(chan<- []byte))
-	}
-
-	for _, key := range ss {
-		c, ok := m.Load(key)
-		if !ok || c == nil {
-			t.Fatal("handlerMap.Load() failed")
-		}
-	}
-
-	m.Range(func(_ string, c chan<- []byte) bool {
-		close(c)
-		return true
-	})
+type testHandler struct {
+	ctx    context.Context
+	stream string
+	events chan []byte
 }
 
-func Test_handlerMap_LoadOrStore(t *testing.T) {
-	var m handlerMap
-
-	tests := []struct {
-		stream string
-		want   bool
-		wantOk bool
-	}{
-		{
-			"one",
-			true,
-			false,
-		},
-		{
-			"two",
-			true,
-			false,
-		},
-		{
-			"one",
-			true,
-			true,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.stream, func(t *testing.T) {
-			got, ok := m.LoadOrStore(tt.stream, make(chan<- []byte))
-
-			if (got != nil) != tt.want {
-				t.Errorf("handlerMap.LoadOrStore() got = %v, want %v", got, tt.want)
-			}
-			if ok != tt.wantOk {
-				t.Errorf("handlerMap.LoadOrStore() got1 = %v, want %v", ok, tt.wantOk)
-			}
-		})
+func newTestHandler(ctx context.Context, stream string, bufLen int) *testHandler {
+	return &testHandler{
+		ctx:    ctx,
+		stream: stream,
+		events: make(chan []byte, bufLen),
 	}
 }
+
+func (h *testHandler) Event(data []byte) {
+	zerolog.Ctx(h.ctx).Debug().RawJSON("data", data).Str("stream", h.stream).Msg("testHandler")
+	h.events <- data
+}
+
+func (h *testHandler) Done() {
+	zerolog.Ctx(h.ctx).Info().Msg("testHandler Done")
+	close(h.events)
+}
+
+type panicHandler struct{}
+
+func (panicHandler) Event([]byte) { panic("foo") }
+func (panicHandler) Done()        {}
 
 func TestStream_dispatch(t *testing.T) {
 	logger := zerolog.New(zerolog.NewTestWriter(t))
 
 	tests := []struct {
 		name       string
-		resp       streamResponse
+		data       string
 		wantMethod wsMethodResponse
 		wantStream []byte
 	}{
 		{
 			"unhandeled",
-			streamResponse{
-				Stream: "spanac",
-				Data:   json.RawMessage(`["Hello, World!"]`),
-			},
+			`{"stream":"spanac","data":["Hello, World!"]}`,
 			wsMethodResponse{},
 			nil,
 		},
 		{
 			"stream handler",
-			streamResponse{
-				Stream: "handler",
-				Data:   json.RawMessage(`["Hello, World!"]`),
-			},
+			`{"stream":"handler","data":["Hello, World!"]}`,
 			wsMethodResponse{},
 			[]byte(`["Hello, World!"]`),
 		},
 		{
 			"method response",
-			streamResponse{
-				ID:     1,
-				Result: "Hello, World!",
-			},
+			`{"id":1,"result":"Hello, World!"}`,
 			wsMethodResponse{
 				ID:     1,
 				Result: "Hello, World!",
@@ -129,33 +88,19 @@ func TestStream_dispatch(t *testing.T) {
 		},
 		{
 			"method response not found",
-			streamResponse{
-				ID:     99,
-				Result: "Hello, World!",
-			},
+			`{"id":99,"result":"Hello, World!"}`,
 			wsMethodResponse{},
 			nil,
 		},
 		{
 			"unhandeled error",
-			streamResponse{
-				Error: &wsMethodError{
-					Code: 3,
-					Msg:  "foobar",
-				},
-			},
+			`{"error":{"Code":3,"Msg":"foobar"}}`,
 			wsMethodResponse{},
 			nil,
 		},
 		{
 			"error",
-			streamResponse{
-				Error: &wsMethodError{
-					Code: 3,
-					Msg:  "foobar",
-				},
-				ID: 1,
-			},
+			`{"error":{"Code":3,"Msg":"foobar"},"id":1}`,
 			wsMethodResponse{
 				ID: 1,
 				Error: &wsMethodError{
@@ -163,6 +108,12 @@ func TestStream_dispatch(t *testing.T) {
 					Msg:  "foobar",
 				},
 			},
+			nil,
+		},
+		{
+			"recover",
+			`!`,
+			wsMethodResponse{},
 			nil,
 		},
 	}
@@ -175,47 +126,45 @@ func TestStream_dispatch(t *testing.T) {
 			rc := make(chan wsMethodResponse, 1)
 			s.addReponseChan(rc)
 
-			handler := make(chan []byte, 1)
+			handler := newTestHandler(s.ctx, "dispatch_test", 1)
+
 			s.handlers.Store("handler", handler)
 
-			s.dispatch(tt.resp)
+			s.wg.Add(1)
+			go s.dispatch([]byte(tt.data))
+			s.wg.Wait()
 
 			close(rc)
-			close(handler)
+			handler.Done()
 
 			if got := <-rc; !reflect.DeepEqual(got, tt.wantMethod) {
 				t.Errorf("Stream.dispatch() method resp = %v, want %v", got, tt.wantMethod)
 			}
 
-			if got := <-handler; !reflect.DeepEqual(got, tt.wantStream) {
-				t.Errorf("Stream.dispatch() stream resp = %s, want %s", got, tt.wantStream)
+			gotData := <-handler.events
+			if !reflect.DeepEqual(gotData, tt.wantStream) {
+				t.Errorf("Stream.dispatch() stream resp = %s, want %s", gotData, tt.wantStream)
 			}
 
 		})
 	}
-}
 
-func TestStream_dispatch_blocked(t *testing.T) {
-	logger := zerolog.New(zerolog.NewTestWriter(t))
+	t.Run("panic", func(t *testing.T) {
+		s := &Stream{
+			ctx: logger.WithContext(testCTX),
+		}
 
-	s := &Stream{
-		ctx: logger.WithContext(testCTX),
-	}
+		s.handlers.Store("handler", panicHandler{})
 
-	handler := make(chan []byte)
-	s.handlers.Store("handler", handler)
+		defer func() {
+			if recover() == nil {
+				t.Error("recover returned nil")
+			}
+		}()
 
-	go s.dispatch(streamResponse{
-		Stream: "handler",
-		Data:   json.RawMessage(`["Hello, World!"]`),
+		s.wg.Add(1)
+		s.dispatch([]byte(`{"stream":"handler","data":["Hello, World!"]}`))
 	})
-
-	time.Sleep(1500 * time.Millisecond)
-
-	want := []byte(`["Hello, World!"]`)
-	if got := <-handler; !reflect.DeepEqual(got, want) {
-		t.Errorf("Stream.dispatch() stream resp = %s, want %s", got, want)
-	}
 }
 
 func TestNewStream(t *testing.T) {
@@ -440,25 +389,31 @@ func TestStream_Subscribe(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.stream, func(t *testing.T) {
-			got, err := s.Subscribe(tt.stream, 0)
+			handler := newTestHandler(logger.WithContext(ctx), tt.stream, 100)
+
+			err := s.Subscribe(tt.stream, handler)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("Stream.Subscribe() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 
 			if !tt.wantErr {
-				if <-got == nil {
-					t.Fatal("no data received")
+				select {
+				case event := <-handler.events:
+					if event != nil {
+						return // success
+					}
+				case <-time.After(5 * time.Second):
+					// time-out
 				}
 
-				go func() {
-					for g := range got {
-						logger.Debug().RawJSON("got", g).Msg("")
-					}
-				}()
+				if <-handler.events == nil {
+					t.Fatal("no data received")
+				}
 			}
 		})
 	}
+
 	s.cancel()
 	s.wg.Wait()
 }
@@ -474,22 +429,18 @@ func TestStream_Unsubscribe(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c, err := s.Subscribe("btcusdt@aggTrade", 1)
-	if err != nil {
+	const stream = "btcusdt@aggTrade"
+	handler := newTestHandler(logger.WithContext(ctx), stream, 100)
+
+	if err := s.Subscribe(stream, handler); err != nil {
 		t.Fatal(err)
 	}
 
-	go func() {
-		for g := range c {
-			logger.Debug().RawJSON("got", g).Msg("")
-		}
-	}()
-
-	if err = s.Unsubscribe("btcusdt@aggTrade"); err != nil {
+	if err = s.Unsubscribe(stream); err != nil {
 		t.Fatal(err)
 	}
 
-	if err = s.Unsubscribe("btcusdt@aggTrade"); err != nil {
+	if err = s.Unsubscribe(stream); err != nil {
 		t.Fatal(err)
 	}
 

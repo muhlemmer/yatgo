@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -49,4 +50,48 @@ func DialWebsocket(ctx context.Context, dialer *websocket.Dialer, endpoint strin
 	}
 
 	return conn, nil
+}
+
+// JSONStreamHandler handels incomming JSON messages on a websocket.
+type JSONHandler interface {
+	// Event is called on each complete JSON message.
+	// Panics during execution must not infuence the socket listener.
+	Event(data []byte)
+
+	// Done is called when the orignating stream is closed or unsubscribed.
+	// Handlers should expect Event calls untill Done is called,
+	// even after unsubscribing to a stream.
+	Done()
+}
+
+// SyncMap is a type-safe generic wrapper of sync.Map
+type SyncMap[K, V any] struct {
+	sync.Map
+}
+
+func (m *SyncMap[K, V]) Store(key K, value V) { m.Map.Store(key, value) }
+
+func (m *SyncMap[K, V]) Load(key K) (value V, ok bool) {
+	x, _ := m.Map.Load(key)
+	value, ok = x.(V)
+	return value, ok
+}
+
+func (m *SyncMap[K, V]) LoadOrStore(key K, value V) (actual V, loaded bool) {
+	x, loaded := m.Map.LoadOrStore(key, value)
+	actual = x.(V)
+
+	return actual, loaded
+}
+
+func (m *SyncMap[K, V]) LoadAndDelete(key K) (value V, ok bool) {
+	x, _ := m.Map.LoadAndDelete(key)
+	value, ok = x.(V)
+	return value, ok
+}
+
+func (m *SyncMap[K, V]) Range(f func(key K, value V) bool) {
+	m.Map.Range(func(key, value any) bool {
+		return f(key.(K), value.(V))
+	})
 }
