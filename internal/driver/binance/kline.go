@@ -21,6 +21,9 @@ package binance
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
+
+	"github.com/muhlemmer/yatgo/internal/driver"
 )
 
 type KlineInterval string
@@ -103,4 +106,34 @@ func (s *Stream) SubscribeKlines(symbol string, interval KlineInterval, handler 
 
 func (s *Stream) UnsubscribeKlines(symbol string, interval KlineInterval) error {
 	return s.Unsubscribe(klineStreamName(symbol, interval))
+}
+
+type closingPriceHandler struct {
+	h driver.ClosingPriceHandler
+}
+
+func (h *closingPriceHandler) Event(event KlineEvent) {
+	price, err := strconv.ParseFloat(event.Kline.Close, 64)
+	if err != nil {
+		panic(fmt.Errorf("closing price event: %w", err))
+	}
+
+	h.h.Event(driver.ClosingPrice{
+		Price:  price,
+		Closed: event.Kline.Closed,
+	})
+}
+
+func (h *closingPriceHandler) Done() {
+	h.h.Done()
+}
+
+func (s *Stream) SubscribeClosingPrices(symbol string, interval string, handler driver.ClosingPriceHandler) error {
+	return s.SubscribeKlines(symbol, KlineInterval(interval),
+		&closingPriceHandler{h: handler},
+	)
+}
+
+func (s *Stream) UnsubscribeClosingPrices(symbol string, interval string) error {
+	return s.UnsubscribeKlines(symbol, KlineInterval(interval))
 }
