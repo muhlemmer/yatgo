@@ -70,7 +70,7 @@ func (c *Client) tryRequest(ctx context.Context, method string, u url.URL, body 
 	return resp, err
 }
 
-// Get performs a HTTP request against all configured hosts, using path and URL encoded values.
+// Get (re)tries a HTTP request against all configured hosts, using path and URL encoded values.
 // It returns after the first successfull call produces a status code <500.
 // All status codes <500 are considered success and should be handeled by the caller.
 func (c *Client) Get(ctx context.Context, path string, values url.Values) (resp *http.Response, err error) {
