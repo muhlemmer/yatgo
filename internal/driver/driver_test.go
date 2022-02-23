@@ -36,7 +36,7 @@ var (
 
 func testMain(m *testing.M) int {
 	var cancel context.CancelFunc
-	testCTX, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+	testCTX, cancel = context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
 	errCTX, cancel = context.WithCancel(testCTX)
